@@ -44,20 +44,20 @@ api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
 async def get_api_key(header_key: str = Security(api_key_header)):
     llave_servidor = os.getenv("API_SECRET_KEY")
-    if header_key == llave_servidor:
+    if header_key and header_key == llave_servidor:
         return header_key
     raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail="Acceso no autorizado")
 
 # --- CONEXIÓN A DB ---
 def get_db_connection():
+    # Eliminamos autocommit=True para permitir transacciones ACID seguras en ventas
     return pymysql.connect(
         host=os.getenv("DB_HOST"),
         port=int(os.getenv("DB_PORT", 3306)),
         user=os.getenv("DB_USER"),
         password=os.getenv("DB_PASSWORD"),
         database=os.getenv("DB_NAME"),
-        cursorclass=pymysql.cursors.DictCursor,
-        autocommit=True
+        cursorclass=pymysql.cursors.DictCursor
     )
 
 # --- MODELOS ---
@@ -69,13 +69,13 @@ class EntradaStock(BaseModel):
 class ItemVenta(BaseModel):
     codigo_barras: str
     cantidad: int
-    total: float  
+    precio_unitario: float  # Cambiado de 'total' a 'precio_unitario' para ser semánticamente correcto
 
 class VentaCompleta(BaseModel):
-    id_venta: int 
+    id_venta: int # ID local (Android)
     total: float
     productos: List[ItemVenta]
-    fecha: str
+    fecha: Optional[str] = None # Opcional por si se registra directo en backend
 
 class Usuario(BaseModel):
     nombre: str
@@ -108,6 +108,7 @@ class ProductoNuevo(BaseModel):
     id_prov: int
     precio: float
     precio_c: float
+
 # ================================================================
 # ADMINISTRACIÓN DE USUARIOS Y AUTH
 # ================================================================
@@ -121,6 +122,12 @@ def login(auth: LoginRequest):
             user = cursor.fetchone()
             if not user or not verificar_password(auth.password, user['password_hash']):
                 raise HTTPException(status_code=401, detail="Credenciales incorrectas")
+            
+            if user['estado'] != 'Activo':
+                raise HTTPException(status_code=403, detail="El usuario se encuentra desactivado")
+                
+            # No devolvemos el hash de la contraseña por seguridad
+            user.pop('password_hash', None)
             return user
     finally:
         conn.close()
@@ -133,7 +140,11 @@ def registrar_usuario(u: Usuario):
         with conn.cursor() as cursor:
             cursor.execute("INSERT INTO usuarios (nombre, correo, password_hash, rol, estado) VALUES (%s, %s, %s, %s, 'Activo')",
                            (u.nombre, u.correo, password_hasheada, u.rol))
-            return {"status": "success"}
+        conn.commit()
+        return {"status": "success"}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
 
@@ -153,7 +164,8 @@ def desactivar_usuario(id_usuario: int):
     try:
         with conn.cursor() as cursor:
             cursor.execute("UPDATE usuarios SET estado = 'Inactivo' WHERE id_usuario = %s", (id_usuario,))
-            return {"status": "success", "message": "Usuario desactivado"}
+        conn.commit()
+        return {"status": "success", "message": "Usuario desactivado"}
     finally:
         conn.close()
 
@@ -163,7 +175,8 @@ def activar_usuario(id_usuario: int):
     try:
         with conn.cursor() as cursor:
             cursor.execute("UPDATE usuarios SET estado = 'Activo' WHERE id_usuario = %s", (id_usuario,))
-            return {"status": "success", "message": "Usuario activado correctamente"}
+        conn.commit()
+        return {"status": "success", "message": "Usuario activado correctamente"}
     finally:
         conn.close()
 
@@ -173,7 +186,8 @@ def eliminar_usuario(id_usuario: int):
     try:
         with conn.cursor() as cursor:
             cursor.execute("DELETE FROM usuarios WHERE id_usuario = %s", (id_usuario,))
-            return {"status": "success", "message": "Usuario eliminado"}
+        conn.commit()
+        return {"status": "success", "message": "Usuario eliminado"}
     finally:
         conn.close()
 
@@ -186,14 +200,13 @@ def obtener_proveedores():
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            # Aseguramos que exista la columna nombre_empresa
             cursor.execute("SELECT id_proveedor, nombre_empresa FROM proveedores ORDER BY nombre_empresa ASC")
             return cursor.fetchall()
     finally:
         conn.close()
 
 @app.post("/api/admin/proveedores/crear", dependencies=[Depends(get_api_key)])
-def crear_proveedor(p: ProveedorNuevo): # <--- Ahora recibe un objeto
+def crear_proveedor(p: ProveedorNuevo):
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
@@ -201,7 +214,11 @@ def crear_proveedor(p: ProveedorNuevo): # <--- Ahora recibe un objeto
                 "INSERT INTO proveedores (nombre_empresa, contacto_nombre, telefono) VALUES (%s, %s, %s)", 
                 (p.nombre, p.contacto, p.tel)
             )
-            return {"status": "success"}
+        conn.commit()
+        return {"status": "success"}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
 
@@ -210,7 +227,6 @@ def registrar_entrada(e: EntradaStock):
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            # 1. Actualizar existencias Y el precio de compra en la tabla productos
             cursor.execute("""
                 UPDATE productos 
                 SET existencias = existencias + %s, 
@@ -218,23 +234,24 @@ def registrar_entrada(e: EntradaStock):
                 WHERE codigo_barras = %s
             """, (e.cantidad, e.precio_compra, e.codigo))
             
-            # 2. Registrar el movimiento en el historial
             cursor.execute("""
                 INSERT INTO historial_stock (codigo_barras, cantidad_cambio, tipo_movimiento, fecha_movimiento)
-                VALUES (%s, %s, 'ENTRADA_PROVEEDOR', NOW())
-            """, (e.codigo, e.cantidad))
-            
-            return {"status": "success"}
+                VALUES (%s, %s, 'ENTRADA_PROVEEDOR', %s)
+            """, (e.codigo, e.cantidad, obtener_ahora_str()))
+        conn.commit()
+        return {"status": "success"}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
 
 @app.post("/api/admin/inventario/crear-producto", dependencies=[Depends(get_api_key)])
-def crear_producto(p: ProductoNuevo): # <--- Ahora recibe el objeto completo
+def crear_producto(p: ProductoNuevo):
     conn = get_db_connection()
     try:
         fecha_final = obtener_ahora_str()
         with conn.cursor() as cursor:
-            # Usamos p.propiedad para acceder a los datos del JSON
             cursor.execute("""
                 INSERT INTO productos 
                 (codigo_barras, nombre_producto, existencias, stock_minimo, id_proveedor, precio_venta, precio_compra) 
@@ -247,8 +264,10 @@ def crear_producto(p: ProductoNuevo): # <--- Ahora recibe el objeto completo
                 VALUES (%s, %s, 'ENTRADA_PROVEEDOR', %s)
             """, (p.codigo, p.stock, fecha_final))
             
-            return {"status": "success"}
+        conn.commit()
+        return {"status": "success"}
     except Exception as e:
+        conn.rollback()
         print(f"Error al crear producto: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -259,10 +278,6 @@ def pedidos_sugeridos_avanzado():
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            # Esta consulta calcula:
-            # 1. La fecha del último ingreso de stock por producto.
-            # 2. Las ventas realizadas desde esa fecha hasta hoy.
-            # 3. La sugerencia (pedir lo mismo que se vendió para mantener stock).
             query = """
                 SELECT 
                     p.codigo_barras, 
@@ -293,14 +308,13 @@ def pedidos_sugeridos_avanzado():
         conn.close()
 
 # ================================================================
-# Ventas
+# Ventas Historial
 # ================================================================
 @app.get("/api/ventas/historial-hoy")
 def historial_ventas_hoy():
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            # Consulta que trae la venta y los nombres de los productos vendidos
             query = """
                 SELECT 
                     v.id_venta, 
@@ -318,6 +332,7 @@ def historial_ventas_hoy():
             return cursor.fetchall()
     finally:
         conn.close()
+
 # ================================================================
 # CORTE DE CAJA
 # ================================================================
@@ -326,7 +341,6 @@ def reporte_corte_detallado(fecha: str = Query(...)):
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            # Cálculos financieros
             cursor.execute("""
                 SELECT 
                     SUM(dv.cantidad * dv.precio_unitario) as ingresos,
@@ -338,11 +352,9 @@ def reporte_corte_detallado(fecha: str = Query(...)):
             """, (fecha,))
             res = cursor.fetchone()
             
-            # Listado de tickets
             cursor.execute("SELECT id_venta, total, fecha_venta FROM ventas WHERE DATE(fecha_venta) = %s", (fecha,))
             detalles = cursor.fetchall()
             
-            # Formateo seguro de nulos
             ingresos = float(res['ingresos']) if res and res['ingresos'] else 0.0
             ganancia = float(res['ganancia']) if res and res['ganancia'] else 0.0
             
@@ -353,8 +365,9 @@ def reporte_corte_detallado(fecha: str = Query(...)):
             }
     finally:
         conn.close()
+
 # ================================================================
-# HISTORIALES Y DASHBOARD (RECUPERADOS)
+# HISTORIALES Y DASHBOARD
 # ================================================================
 
 @app.get("/api/admin/historial/ventas", dependencies=[Depends(get_api_key)])
@@ -411,7 +424,6 @@ def datos_grafico_ventas():
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            # Obtenemos las ventas sumadas por día de la última semana
             query = """
                 SELECT DATE(fecha_venta) as fecha, SUM(total) as total_dia
                 FROM ventas
@@ -425,7 +437,7 @@ def datos_grafico_ventas():
         conn.close()
 
 # ================================================================
-# MÓDULO 
+# PRODUCTOS
 # ================================================================
 
 @app.get("/listar_productos")
@@ -433,49 +445,58 @@ def listar_productos():
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            # Asegúrate de incluir 'id_proveedor' en la consulta
             query = "SELECT codigo_barras, nombre_producto, existencias, precio_venta, precio_compra, stock_minimo, id_proveedor FROM productos"
             cursor.execute(query)
             return cursor.fetchall()
     finally:
         conn.close()
 
+# ================================================================
+# PROCESAMIENTO DE VENTAS (Sincronización Android / Venta Directa)
+# ================================================================
+
 @app.post("/vender_detalle", dependencies=[Depends(get_api_key)])
 async def vender_detalle(venta: VentaCompleta):
-    conexion = get_db_connection()
+    conexion = None
     try:
+        conexion = get_db_connection()
         with conexion.cursor() as cursor:
             try:
+                # Usamos la fecha enviada por Android, si no viene, generamos la actual
+                fecha_venta = venta.fecha if venta.fecha else obtener_ahora_str()
+                
                 cursor.execute("INSERT INTO ventas (total, id_android_local, fecha_venta) VALUES (%s, %s, %s)", 
-                               (float(venta.total), int(venta.id_venta), str(venta.fecha)))
+                               (float(venta.total), int(venta.id_venta), str(fecha_venta)))
                 id_generado = conexion.insert_id()
+                
                 for p in venta.productos:
                     cursor.execute("INSERT INTO detalles_ventas (id_venta_fk, codigo_barras, cantidad, precio_unitario) VALUES (%s, %s, %s, %s)",
-                                   (id_generado, p.codigo_barras, p.cantidad, p.total))
+                                   (id_generado, p.codigo_barras, p.cantidad, p.precio_unitario))
+                    
                     cursor.execute("UPDATE productos SET existencias = existencias - %s WHERE codigo_barras = %s", (p.cantidad, p.codigo_barras))
+                    
                     cursor.execute("INSERT INTO historial_stock (codigo_barras, cantidad_cambio, tipo_movimiento, fecha_movimiento) VALUES (%s, %s, 'VENTA', %s)",
-                                   (p.codigo_barras, -p.cantidad, venta.fecha))
+                                   (p.codigo_barras, -p.cantidad, fecha_venta))
+                
                 conexion.commit()
                 return {"status": "ok", "id_nube": id_generado}
             except pymysql.err.IntegrityError:
+                if conexion: conexion.rollback()
                 return {"status": "success", "message": "Ya sincronizada", "id_nube": -1}
     except Exception as e:
         if conexion: conexion.rollback()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        conexion.close()
-
-# ================================================================
-# MÓDULO DE VENTAS (NUEVO)
-# ================================================================
+        if conexion: conexion.close()
 
 @app.post("/api/ventas/registrar", dependencies=[Depends(get_api_key)])
 def registrar_venta_completa(venta: VentaCompleta):
-    conn = get_db_connection()
+    conn = None
     try:
+        conn = get_db_connection()
         with conn.cursor() as cursor:
             fecha_actual = obtener_ahora_str()
-            # Quitamos el id_android_local si no es necesario o lo ponemos como opcional
+            
             cursor.execute(
                 "INSERT INTO ventas (total, fecha_venta) VALUES (%s, %s)",
                 (venta.total, fecha_actual)
@@ -485,7 +506,7 @@ def registrar_venta_completa(venta: VentaCompleta):
             for item in venta.productos:
                 cursor.execute(
                     "INSERT INTO detalles_ventas (id_venta_fk, codigo_barras, cantidad, precio_unitario) VALUES (%s, %s, %s, %s)",
-                    (id_venta, item.codigo_barras, item.cantidad, item.total)
+                    (id_venta, item.codigo_barras, item.cantidad, item.precio_unitario)
                 )
                 cursor.execute(
                     "UPDATE productos SET existencias = existencias - %s WHERE codigo_barras = %s",
@@ -499,12 +520,11 @@ def registrar_venta_completa(venta: VentaCompleta):
             conn.commit()
             return {"status": "success", "id_venta": id_venta}
     except Exception as e:
-        conn.rollback()
-        # Esto te ayudará a ver el error real en los logs de la API
+        if conn: conn.rollback()
         print(f"Error en venta: {str(e)}") 
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        conn.close()
+        if conn: conn.close()
 
 if __name__ == "__main__":
     import uvicorn
